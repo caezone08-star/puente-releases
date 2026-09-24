@@ -6,8 +6,9 @@ name: Compilar y publicar Puente
 # El 2026-09-23 el cupo de minutos del repositorio privado se agoto y la 0.1.14 no pudo salir.
 #
 # La copia que manda es .github/publicar-gratis/compilar.yml en la fuente privada; esta es su copia.
-# Las pruebas no corren aqui: sus registros serian publicos. Corren antes en el PC del dueno
-# (app:refresh). Los avisos del compilador se silencian porque imprimen lineas de codigo.
+# Las pruebas de Windows corren antes en el PC del dueno (app:refresh). Las de Mac corren aqui con la
+# salida guardada en un archivo: el registro publico solo dice cuantas pasaron y cuales fallaron.
+# Los avisos del compilador se silencian porque imprimen lineas de codigo.
 # Se lanza a mano: gh workflow run compilar.yml -R caezone08-star/puente-releases -f ref=<commit>
 
 on:
@@ -59,6 +60,12 @@ jobs:
           node-version: 22
       - name: Preparar Rust
         uses: dtolnay/rust-toolchain@stable
+      # Guardar lo compilado entre versiones: sin esto Windows tardaba 11 minutos compilando todo desde
+      # cero (corrida 35944585049). Lo guardado equivale a lo que ya trae el instalador publico.
+      - name: Reusar lo compilado antes
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
       - name: Instalar dependencias reproducibles
         run: npm ci --no-audit --no-fund --loglevel=error
       - name: Compilar y firmar
@@ -75,9 +82,68 @@ jobs:
           path: publicar/
           retention-days: 1
 
+  # Las pruebas de Mac corren aqui porque es gratis, con la salida guardada en un archivo que no se
+  # publica: el registro publico solo dice cuantas pasaron y el nombre de las que fallaron. Sin este
+  # trabajo ninguna prueba corria en un Mac antes de publicar (hallazgo
+  # finding-con-la-publicacion-gratis-las-pruebas-de-mac-dejaron-de-correr-antes-de-cada-version-1790219870961).
+  probar-mac:
+    name: Pruebas en macOS
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -Awarnings
+      TAURI_CONFIG: '{"bundle":{"externalBin":[]}}'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Obtener fuente privada
+        uses: actions/checkout@v4
+        with:
+          repository: caezone08-star/Proyecto-Puente-Padre
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PUENTE_SOURCE_TOKEN }}
+          persist-credentials: false
+      - name: Preparar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Preparar Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Reusar lo compilado antes
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Preparar la maquina como la deja la app
+        run: |
+          npm ci --no-audit --no-fund --loglevel=error > "$RUNNER_TEMP/preparar.log" 2>&1
+          npm run build >> "$RUNNER_TEMP/preparar.log" 2>&1
+          cargo install --debug --locked --path src-tauri --bin puente-agent --target-dir src-tauri/target >> "$RUNNER_TEMP/preparar.log" 2>&1
+          cargo run --manifest-path src-tauri/Cargo.toml --bin puente-agent -- protocol-adopt-bundled >> "$RUNNER_TEMP/preparar.log" 2>&1
+          cargo run --manifest-path src-tauri/Cargo.toml --bin puente-agent -- parent-state-restore >> "$RUNNER_TEMP/preparar.log" 2>&1
+          git config --global user.name "Validar Puente"
+          git config --global user.email "validar-puente@users.noreply.github.com"
+          echo "maquina preparada"
+      - name: Probar contratos
+        run: |
+          set +e
+          npm run test:boundaries > "$RUNNER_TEMP/contratos.log" 2>&1
+          codigo=$?
+          grep -E '^# (pass|fail) ' "$RUNNER_TEMP/contratos.log"
+          grep -E '^not ok ' "$RUNNER_TEMP/contratos.log" | sed -E 's/^not ok [0-9]+ - /falla: /'
+          exit $codigo
+      - name: Probar nucleo Rust
+        run: |
+          set +e
+          npm run validate:tauri > "$RUNNER_TEMP/rust.log" 2>&1
+          codigo=$?
+          grep -E '^test result: ' "$RUNNER_TEMP/rust.log"
+          grep -E '^test .* FAILED$' "$RUNNER_TEMP/rust.log"
+          exit $codigo
+
   publicar:
     name: Publicar la version
-    needs: compilar
+    needs: [compilar, probar-mac]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
