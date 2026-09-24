@@ -1,0 +1,108 @@
+name: Compilar y publicar Puente
+
+# Vive en caezone08-star/puente-releases, que es publico: ahi GitHub no cobra minutos, tampoco los
+# del Mac. La fuente sigue privada: se lee con un token de solo lectura (secreto
+# PUENTE_SOURCE_TOKEN) y en este repositorio solo quedan los instaladores, como siempre.
+# El 2026-09-23 el cupo de minutos del repositorio privado se agoto y la 0.1.14 no pudo salir.
+#
+# La copia que manda es .github/publicar-gratis/compilar.yml en la fuente privada; esta es su copia.
+# Las pruebas no corren aqui: sus registros serian publicos. Corren antes en el PC del dueno
+# (app:refresh). Los avisos del compilador se silencian porque imprimen lineas de codigo.
+# Se lanza a mano: gh workflow run compilar.yml -R caezone08-star/puente-releases -f ref=<commit>
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit de la fuente privada que se publica
+        required: true
+      notas:
+        description: Que cambio en esta version, en palabras del dueno
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publicar
+  cancel-in-progress: false
+
+jobs:
+  compilar:
+    name: Compilar ${{ matrix.plataforma }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            plataforma: windows-x86_64
+            bundles: nsis
+          - os: macos-14
+            plataforma: darwin-aarch64
+            bundles: app,dmg
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      RUSTFLAGS: -Awarnings
+    steps:
+      - name: Obtener fuente privada
+        uses: actions/checkout@v4
+        with:
+          repository: caezone08-star/Proyecto-Puente-Padre
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PUENTE_SOURCE_TOKEN }}
+          persist-credentials: false
+      - name: Preparar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Preparar Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Instalar dependencias reproducibles
+        run: npm ci --no-audit --no-fund --loglevel=error
+      - name: Compilar y firmar
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: npm run tauri -- build --bundles ${{ matrix.bundles }}
+      - name: Reunir lo que se publica
+        run: node scripts/reunir-publicacion.mjs ${{ matrix.plataforma }} publicar
+      - name: Guardar la compilacion
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.plataforma }}
+          path: publicar/
+          retention-days: 1
+
+  publicar:
+    name: Publicar la version
+    needs: compilar
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Obtener fuente privada
+        uses: actions/checkout@v4
+        with:
+          repository: caezone08-star/Proyecto-Puente-Padre
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PUENTE_SOURCE_TOKEN }}
+          persist-credentials: false
+      - name: Traer las compilaciones
+        uses: actions/download-artifact@v4
+        with:
+          path: publicar
+          merge-multiple: true
+      - name: Unir las plataformas en latest.json
+        run: node scripts/reunir-publicacion.mjs --manifiesto publicar
+      - name: Subir y releer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTAS: ${{ inputs.notas }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          gh release create "v$version" --repo "${{ github.repository }}" --title "Puente $version" --notes "${NOTAS:-Puente $version}" publicar/latest.json publicar/Puente_*
+          gh release download "v$version" --repo "${{ github.repository }}" --pattern latest.json --output leido.json
+          node -e "const a=require('./leido.json'),b=require('./publicar/latest.json');if(a.version!==b.version||Object.keys(a.platforms).length!==2)process.exit(1);console.log('Publicada',a.version,'para',Object.keys(a.platforms).join(' y '))"
